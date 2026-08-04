@@ -130,6 +130,11 @@ PBP_COLS = [
     "wp", "posteam_score", "defteam_score", "score_differential",
     "fumble_lost", "interception", "touchdown", "field_goal_result",
     "punt_net_yards", "drive", "qb_dropback", "sack", "penalty",
+    # goal_to_go: flag nflverse per il fix goal-to-go in drive_markov.py
+    # (distance_bucket dedicato invece di lasciare ydstogo grezzo vicino
+    # alla end zone). safety: serve a classificare correttamente le drive
+    # che finiscono in safety, prima scartate silenziosamente.
+    "goal_to_go", "safety",
 ]
 
 
