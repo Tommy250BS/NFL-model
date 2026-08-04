@@ -54,6 +54,7 @@ FEATURE_COLS = [
     "off_epa_3rd_down_roll", "off_epa_redzone_roll", "turnover_diff_roll",
     "plays_roll", "pace_roll",
     "travel_distance", "tz_diff",
+    "drive_epd_off", "drive_epd_def",
     "injury_burden", "opp_injury_burden", "qb_out", "opp_qb_out",
 ]
 
