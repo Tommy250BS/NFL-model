@@ -22,6 +22,7 @@ from feature_engineering import (
     regularize_cpoe,
     QBAdjustedElo,
 )
+from drive_markov import build_walk_forward_drive_features
 
 
 def _trailing_situational_features(tg: pd.DataFrame, games: pd.DataFrame, window=4) -> pd.DataFrame:
@@ -58,11 +59,20 @@ def _trailing_situational_features(tg: pd.DataFrame, games: pd.DataFrame, window
 
 def build_walk_forward_features(years, ridge_lambda=25.0, min_week_for_epa=3,
                                  qb_weight=None, k_team=None, k_qb=None,
+                                 include_drive_features=False, drive_prior_strength=50.0, drive_n_value_iters=20,
                                  _pbp=None, _games=None):
     """qb_weight/k_team/k_qb: passati a QBAdjustedElo, default None = usa i
     default di classe. Esposti per grid search (walk_forward_backtest.py).
     _pbp/_games: permettono di riusare pbp/games gia' caricati fra chiamate
-    ripetute della grid search invece di ri-scaricare/ri-parsare ogni volta."""
+    ripetute della grid search invece di ri-scaricare/ri-parsare ogni volta.
+
+    include_drive_features: se True, aggiunge drive_epd_off/drive_epd_def
+    (expected points per drive, walk-forward, vedi drive_markov.py) alla
+    tabella finale. DEFAULT FALSE perche' e' l'operazione piu' costosa della
+    pipeline (value iteration per squadra per settimana, atteso qualche
+    minuto su 9 stagioni) -- attivalo solo quando vuoi effettivamente
+    valutare se il modello Markov drive-by-drive aiuta XGBoost, non ad ogni
+    run di routine."""
     pbp = _pbp if _pbp is not None else load_pbp(years)
     games = _games if _games is not None else load_games(years)
     tg = build_team_game_table(pbp)
@@ -148,6 +158,19 @@ def build_walk_forward_features(years, ridge_lambda=25.0, min_week_for_epa=3,
 
     result = pd.DataFrame(rows)
     result = result.merge(situational, on=["game_id", "week", "team"], how="left")
+
+    if include_drive_features:
+        drive_feat = build_walk_forward_drive_features(
+            pbp, games, prior_strength=drive_prior_strength, n_value_iters=drive_n_value_iters
+        )
+        result = result.merge(drive_feat, on=["season", "week", "team"], how="left")
+    else:
+        # Colonne presenti comunque (NaN) anche quando include_drive_features=False,
+        # cosi' stacking_model.FEATURE_COLS puo' includerle sempre senza KeyError --
+        # XGBoost gestisce i NaN nativamente (missing=np.nan in train_xgb_margin_model).
+        result["drive_epd_off"] = np.nan
+        result["drive_epd_def"] = np.nan
+
     return result
 
 
