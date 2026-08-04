@@ -21,28 +21,39 @@ nell'opponent-adjusted EPA: con ~11 drive/partita a squadra i dati per
 cella sono comunque pochi, quindi qui usiamo shrinkage bayesiano verso la
 media di lega (stesso principio di regularize_cpoe) invece di una ridge.
 
+BUG STORICO (risolto): transition_probs faceva team_signal = 0.5*p_off +
+0.5*p_def con n_eff dimezzato. compute_expected_points isola sempre un lato
+con LEAGUE_SENTINEL (nessun conteggio -> quel lato ricade su p_league per
+costruzione), quindi meta' del segnale era SEMPRE p_league a prescindere
+dalla numerosita' reale: un tetto strutturale di ~50% di peso massimo sul
+segnale squadra, che rendeva drive_prior_strength quasi ininfluente. Ora il
+blend pesa p_off/p_def per la loro numerosita' reale e n_eff = off_total +
+def_total (vedi commento inline in transition_probs).
+
 LIMITAZIONI NOTE (da affrontare prima di usarlo in produzione)
 ----------------------------------------------------------------
-1. Safety non e' distinguibile con le colonne pbp che teniamo (PBP_COLS in
-   data_ingestion.py) -- andrebbe aggiunta una colonna dedicata o dedotta
-   dal cambio di score_differential di -2 per l'attacco. Per ora il
-   classificatore la ignora (non emette mai SAFETY).
-2. Field position dopo punt/turnover e' approssimata (vedi
+1. Field position dopo punt/turnover e' approssimata (vedi
    simulate_game_score): non usiamo punt_net_yards ne' la posizione reale
    di recupero, solo touchback fisso. E' una semplificazione grossa,
-   probabilmente la prima cosa da migliorare.
-3. Nessun aggiustamento per garbage time / gestione clock nel quarto
+   probabilmente la prossima cosa da migliorare.
+2. Nessun aggiustamento per garbage time / gestione clock nel quarto
    periodo: il modello tratta ogni drive allo stesso modo indipendentemente
    dal punteggio o dal tempo rimasto, quindi sovrastima l'aggressivita' nel
    quarto periodo con partite gia' decise.
-4. goal-to-go (distanza > yardline_100, es. 3rd & 8 dalla 5 yard line) non
-   e' gestito separatamente: il distance_bucket usa ydstogo raw, che vicino
-   alla end zone puo' essere fuorviante (non puoi guadagnare piu' yard di
-   quante te ne separano dalla end zone).
-5. L'adjustment per la difesa avversaria e' un blend lineare semplice
+3. L'adjustment per la difesa avversaria e' un blend lineare semplice
    (vedi DriveMarkovModel.transition_probs), non un vero opponent-adjustment
    via regressione come opponent_adjusted_epa in feature_engineering.py.
-   Puo' essere il prossimo miglioramento naturale.
+   Puo' essere il prossimo miglioramento naturale, ora che il blend non e'
+   piu' strutturalmente cappato.
+
+RISOLTE:
+- Safety ora classificata esplicitamente (richiede la colonna 'safety' in
+  PBP_COLS, vedi data_ingestion.py) invece di essere scartata silenziosamente.
+- goal-to-go gestito con un distance_bucket dedicato (richiede la colonna
+  'goal_to_go' in PBP_COLS) invece di lasciare ydstogo grezzo vicino alla
+  end zone, dove puo' essere fuorviante.
+- Value iteration ora itera fino a convergenza (tolleranza) invece di un
+  numero fisso di passi non verificato.
 """
 
 import numpy as np
@@ -53,6 +64,14 @@ from collections import defaultdict
 # DISCRETIZZAZIONE DELLO STATO
 # =========================
 N_FP_BUCKETS = 10
+# 5 bucket di distanza: 0-3 = distanza normale a fasce (come prima), 4 =
+# goal-to-go dedicato. Prima del fix, un 3rd & 8 dalla 5 yard line (che e'
+# goal-to-go: non puoi guadagnare piu' delle 5 yard che ti separano dalla end
+# zone anche se "servirebbero" 8 yard per il primo down) finiva nel bucket
+# "7-9" insieme a normali 3rd & 8 a centrocampo -- due situazioni con
+# probabilita' di touchdown molto diverse mischiate nella stessa cella.
+N_DISTANCE_BUCKETS = 5
+GOAL_TO_GO_BUCKET = 4
 
 
 def fp_bucket(yardline_100: pd.Series) -> pd.Series:
@@ -60,10 +79,18 @@ def fp_bucket(yardline_100: pd.Series) -> pd.Series:
     return b.astype("Int64")
 
 
-def distance_bucket(ydstogo: pd.Series) -> pd.Series:
-    return pd.cut(
+def distance_bucket(ydstogo: pd.Series, goal_to_go: pd.Series = None) -> pd.Series:
+    """goal_to_go: flag booleano/0-1 da nflverse (colonna 'goal_to_go' in
+    PBP_COLS). Se assente (None), si comporta come prima del fix (nessuna
+    distinzione goal-to-go) -- serve per compatibilita' con eventuali
+    chiamate che non hanno ancora la colonna disponibile."""
+    base = pd.cut(
         ydstogo, bins=[-0.1, 3, 6, 9, 100], labels=[0, 1, 2, 3]
     ).astype("Int64")
+    if goal_to_go is None:
+        return base
+    is_gtg = goal_to_go.fillna(0).astype(int) == 1
+    return base.mask(is_gtg, GOAL_TO_GO_BUCKET)
 
 
 OUTCOMES = [
@@ -131,6 +158,8 @@ def _classify_terminal_outcome(play) -> str:
     dei controlli non arbitrario: touchdown/turnover hanno precedenza su
     down=4 generico, altrimenti un 4th-down-TD verrebbe scambiato per
     turnover on downs."""
+    if play.get("safety", 0) == 1:
+        return "SAFETY"
     if play.get("touchdown", 0) == 1:
         return "TOUCHDOWN"
     if pd.notna(play.get("field_goal_result")):
@@ -212,16 +241,41 @@ class DriveMarkovModel:
 
         outcomes = set(league_probs) | set(off_cell) | set(def_cell)
 
+        # FIX BUG: la versione precedente faceva team_signal = 0.5*p_off +
+        # 0.5*p_def con n_eff = 0.5*off_total + 0.5*def_total. Quando uno dei
+        # due lati e' LEAGUE_SENTINEL (come in compute_expected_points, dove
+        # si isola offense o defense per costruzione), quel lato ha SEMPRE
+        # off_total=0 o def_total=0 -> p_off o p_def ricade su p_league per
+        # definizione. Risultato: meta' del team_signal era sempre p_league
+        # a prescindere da quanti dati avesse la squadra sull'altro lato, e
+        # n_eff era dimezzato inutilmente -> il peso massimo raggiungibile
+        # dal segnale reale era ~50% * (n/(n+prior)), un tetto strutturale
+        # che rendeva drive_prior_strength quasi ininfluente (da qui la bassa
+        # sensibilita' osservata abbassando lo shrinkage da 50 a 15).
+        #
+        # Fix: pesa p_off/p_def per la loro numerosita' reale (nessun
+        # contributo fittizio di p_league quando un lato manca del tutto:
+        # con LEAGUE_SENTINEL il lato mancante e' semplicemente escluso dal
+        # blend, non sostituito da p_league) e usa n_eff = off_total +
+        # def_total (non dimezzato), cosi' con dati sufficienti il segnale
+        # squadra puo' davvero dominare lo shrinkage.
         probs = {}
         w_prior = self.prior_strength
+        n_eff = off_total + def_total
         for o in outcomes:
             p_league = league_probs.get(o, 0.0)
-            p_off = (off_cell.get(o, 0.0) / off_total) if off_total > 0 else p_league
-            p_def = (def_cell.get(o, 0.0) / def_total) if def_total > 0 else p_league
-            # media offesa/difesa, poi shrink verso la lega pesato sulla
-            # numerosita' combinata vista dalla squadra in attacco
-            team_signal = 0.5 * p_off + 0.5 * p_def
-            n_eff = 0.5 * off_total + 0.5 * def_total
+            p_off = (off_cell.get(o, 0.0) / off_total) if off_total > 0 else None
+            p_def = (def_cell.get(o, 0.0) / def_total) if def_total > 0 else None
+
+            if p_off is None and p_def is None:
+                team_signal = p_league
+            elif p_off is None:
+                team_signal = p_def
+            elif p_def is None:
+                team_signal = p_off
+            else:
+                team_signal = (off_total * p_off + def_total * p_def) / (off_total + def_total)
+
             probs[o] = (n_eff * team_signal + w_prior * p_league) / (n_eff + w_prior)
 
         total = sum(probs.values())
