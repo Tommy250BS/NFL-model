@@ -301,6 +301,91 @@ def simulate_game_score(model: DriveMarkovModel, home: str, away: str,
     return home_pts, away_pts
 
 
+# =========================
+# EXPECTED POINTS PER DRIVE (value iteration sulla catena) -- feature per
+# XGBoost, analoga a off_epa_adj/def_epa_adj ma calcolata dalla catena di
+# Markov invece che da una ridge regression su EPA/play.
+# =========================
+LEAGUE_SENTINEL = "__LEAGUE_AVG__"  # chiave mai popolata in off_counts/def_counts:
+                                     # usarla come offense o defense fa collassare
+                                     # quel lato del blend sulla sola media di lega
+                                     # (vedi transition_probs), dando un rating
+                                     # "squadra vs avversario medio" invece che
+                                     # "squadra vs questo avversario specifico".
+
+
+def _all_states():
+    return [(d, db, fb) for d in range(1, 5) for db in range(4) for fb in range(N_FP_BUCKETS)]
+
+
+def compute_expected_points(model: DriveMarkovModel, offense: str, defense: str,
+                             all_states=None, n_iter: int = 20) -> dict:
+    """Value iteration sulla catena assorbente: V(stato) = valore atteso in
+    punti da quello stato in poi, dato come giocano offense/defense secondo
+    transition_probs(). Non e' una vera simulazione Monte Carlo (quella la
+    fa simulate_drive) -- e' il valore atteso esatto (a convergenza), piu'
+    adatto come feature perche' deterministico dato il modello, non
+    rumoroso come una singola simulazione.
+
+    n_iter=20 e' una scelta pratica, non una prova di convergenza: le drive
+    NFL raramente superano 15-18 play, quindi 20 iterazioni di Bellman
+    backup dovrebbero essere piu' che sufficienti perche' il valore si
+    stabilizzi, ma non e' stato verificato formalmente (TODO: controllare
+    |V_k - V_{k-1}| e iterare fino a tolleranza invece di un numero fisso)."""
+    all_states = all_states or _all_states()
+    V = {s: 0.0 for s in all_states}
+    for _ in range(n_iter):
+        newV = {}
+        for s in all_states:
+            probs = model.transition_probs(offense, defense, s)
+            val = 0.0
+            for to, p in probs.items():
+                if to in OUTCOMES:
+                    val += p * POINTS_FOR_OUTCOME[to]
+                else:
+                    val += p * V.get(to, 0.0)
+            newV[s] = val
+        V = newV
+    return V
+
+
+def build_walk_forward_drive_features(pbp: pd.DataFrame, games: pd.DataFrame,
+                                       prior_strength: float = 50.0, n_value_iters: int = 20) -> pd.DataFrame:
+    """Walk-forward vero: per ogni settimana, calcola drive_epd_off/def per
+    ogni squadra usando SOLO il modello aggiornato con le settimane < W (la
+    lettura di compute_expected_points avviene PRIMA di model.update() con i
+    dati della settimana corrente, stesso ordine di operazioni del ciclo
+    settimanale in build_features.py). Nessun leakage.
+
+    COSTO: per ogni settimana si fa value iteration completa (n_value_iters
+    x 160 stati) per ogni squadra x 2 (offense e defense) -- con 32 squadre
+    e ~150 settimane in 9 stagioni sono ~9600 chiamate a
+    compute_expected_points, ciascuna con ~20*160=3200 lookup di
+    transition_probs. E' l'operazione piu' costosa aggiunta finora alla
+    pipeline: aspettati diversi minuti su 2016-2024, non secondi."""
+    transitions = build_play_transitions(pbp).dropna(subset=["to"])
+    model = DriveMarkovModel(prior_strength=prior_strength)
+    teams = sorted(set(games["home_team"]) | set(games["away_team"]))
+    states = _all_states()
+    start_state = (1, 3, fp_bucket(pd.Series([TOUCHBACK_FP])).iloc[0])
+
+    rows = []
+    for (season, week), _ in games.sort_values(["season", "week"]).groupby(["season", "week"]):
+        for team in teams:
+            off_V = compute_expected_points(model, team, LEAGUE_SENTINEL, states, n_iter=n_value_iters)
+            def_V = compute_expected_points(model, LEAGUE_SENTINEL, team, states, n_iter=n_value_iters)
+            rows.append(dict(
+                season=season, week=week, team=team,
+                drive_epd_off=off_V.get(start_state, 0.0),
+                drive_epd_def=def_V.get(start_state, 0.0),
+            ))
+
+        week_transitions = transitions[(transitions["season"] == season) & (transitions["week"] == week)]
+        model.update(week_transitions)
+
+    return pd.DataFrame(rows)
+
+
 if __name__ == "__main__":
     from data_ingestion import load_pbp, load_games
 
