@@ -60,6 +60,7 @@ def _trailing_situational_features(tg: pd.DataFrame, games: pd.DataFrame, window
 def build_walk_forward_features(years, ridge_lambda=25.0, min_week_for_epa=3,
                                  qb_weight=None, k_team=None, k_qb=None,
                                  include_drive_features=False, drive_prior_strength=50.0, drive_n_value_iters=20,
+                                 drive_ridge_lambda=25.0, drive_ridge_weight=0.5, drive_min_drives_for_ridge=20,
                                  _pbp=None, _games=None):
     """qb_weight/k_team/k_qb: passati a QBAdjustedElo, default None = usa i
     default di classe. Esposti per grid search (walk_forward_backtest.py).
@@ -72,7 +73,13 @@ def build_walk_forward_features(years, ridge_lambda=25.0, min_week_for_epa=3,
     pipeline (value iteration per squadra per settimana, atteso qualche
     minuto su 9 stagioni) -- attivalo solo quando vuoi effettivamente
     valutare se il modello Markov drive-by-drive aiuta XGBoost, non ad ogni
-    run di routine."""
+    run di routine.
+
+    drive_ridge_lambda/drive_ridge_weight/drive_min_drives_for_ridge: fix 3
+    in drive_markov.py (opponent-adjustment via ridge invece del solo blend
+    lineare per-stato) -- vedi build_walk_forward_drive_features per il
+    dettaglio. drive_ridge_weight=0.0 disattiva il rating ridge (torna al
+    comportamento solo-Markov)."""
     pbp = _pbp if _pbp is not None else load_pbp(years)
     games = _games if _games is not None else load_games(years)
     tg = build_team_game_table(pbp)
@@ -161,7 +168,9 @@ def build_walk_forward_features(years, ridge_lambda=25.0, min_week_for_epa=3,
 
     if include_drive_features:
         drive_feat = build_walk_forward_drive_features(
-            pbp, games, prior_strength=drive_prior_strength, n_value_iters=drive_n_value_iters
+            pbp, games, prior_strength=drive_prior_strength, n_value_iters=drive_n_value_iters,
+            drive_ridge_lambda=drive_ridge_lambda, drive_ridge_weight=drive_ridge_weight,
+            min_drives_for_ridge=drive_min_drives_for_ridge,
         )
         result = result.merge(drive_feat, on=["season", "week", "team"], how="left")
     else:
@@ -170,6 +179,12 @@ def build_walk_forward_features(years, ridge_lambda=25.0, min_week_for_epa=3,
         # XGBoost gestisce i NaN nativamente (missing=np.nan in train_xgb_margin_model).
         result["drive_epd_off"] = np.nan
         result["drive_epd_def"] = np.nan
+        # colonne diagnostiche del fix 3 (markov puro / ridge puro): NaN per
+        # coerenza di schema, anche se non usate da FEATURE_COLS.
+        result["drive_epd_off_markov"] = np.nan
+        result["drive_epd_def_markov"] = np.nan
+        result["drive_epd_off_ridge"] = np.nan
+        result["drive_epd_def_ridge"] = np.nan
 
     return result
 
